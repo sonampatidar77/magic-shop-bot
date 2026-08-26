@@ -9,9 +9,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
+
 TOKEN = os.environ.get("BOT_TOKEN")
 
 # ═══════════════════════════════════════

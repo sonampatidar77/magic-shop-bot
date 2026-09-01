@@ -1,0 +1,754 @@
+import os
+import random
+import sqlite3
+import threading
+from datetime import datetime
+from html import escape
+from zoneinfo import ZoneInfo
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+TOKEN = os.environ.get("BOT_TOKEN")
+
+# ═══════════════════════════════════════
+# 𐙚 MAGIC SHOP DATA
+# ═══════════════════════════════════════
+
+active_chats = set()
+biases = {}
+last_hour_sent = {}
+quiz_games = {}
+used_truths = {}
+used_dares = {}
+used_wyr = {}
+used_wordgames = {}
+DB_PATH = os.environ.get("BOT_DB_PATH", "magic_shop.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, hourly_enabled INTEGER NOT NULL DEFAULT 1)")
+    conn.execute("CREATE TABLE IF NOT EXISTS members (chat_id INTEGER, user_id INTEGER, first_name TEXT, username TEXT, last_seen TEXT, PRIMARY KEY(chat_id,user_id))")
+    conn.commit(); conn.close()
+
+def remember_member(chat_id, user):
+    if not user or user.is_bot: return
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO members VALUES (?,?,?,?,datetime('now')) ON CONFLICT(chat_id,user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username, last_seen=excluded.last_seen", (chat_id,user.id,user.first_name or "member",user.username or ""))
+    conn.commit(); conn.close()
+
+def activate_chat(chat_id):
+    conn=sqlite3.connect(DB_PATH)
+    conn.execute("INSERT INTO chats(chat_id,hourly_enabled) VALUES(?,1) ON CONFLICT(chat_id) DO UPDATE SET hourly_enabled=1", (chat_id,))
+    conn.commit(); conn.close(); active_chats.add(chat_id)
+
+def persistent_active_chats():
+    conn=sqlite3.connect(DB_PATH); rows=conn.execute("SELECT chat_id FROM chats WHERE hourly_enabled=1").fetchall(); conn.close()
+    return [r[0] for r in rows]
+
+def members_for(chat_id):
+    conn=sqlite3.connect(DB_PATH); rows=conn.execute("SELECT user_id,first_name,username FROM members WHERE chat_id=?",(chat_id,)).fetchall(); conn.close(); return rows
+
+def mention_member(row):
+    uid, first, username=row
+    return f'<a href="tg://user?id={uid}">{first or username or "member"}</a>'
+
+def pick_unused(pool, used, chat_id):
+    seen=used.setdefault(chat_id,set()); available=[x for x in pool if x not in seen]
+    if not available: seen.clear(); available=list(pool)
+    x=random.choice(available); seen.add(x); return x
+
+def clean_answer(x):
+    return ' '.join((x or '').lower().replace('’',"'").replace('&','and').split())
+
+init_db()
+
+# ═══════════════════════════════════════
+# 𐙚 HOURLY MESSAGE — KEEPING YOUR EXACT TEXT
+# ═══════════════════════════════════════
+
+HOURLY_MESSAGE = """‎ꫂ𝑯𝘦𝘺 𝑻𝘩𝘦𝘳𝘦  𝑴𝘰𝘰𝘯𝘪𝘦𝘴 𓍼
+
+𝘩𝘰𝘱𝘦 𝘶𝘳 𝘩𝘢𝘷𝘪𝘯𝘨 𝘢 𝘯𝘪𝘤𝘦 𝘵𝘪𝘮𝘦 𝘢𝘵 𝘔𝘢𝘨𝘪𝘤 𝘚𝘩𝘰𝘱 𝘴𝘰 𝘧𝘢𝘳 
+𝘥𝘰𝘯’𝘵 𝘩𝘦𝘴𝘪𝘵𝘢𝘵𝘦 𝘵𝘰 𝘫𝘰𝘪𝘯 𝘵𝘩𝘦 𝘤𝘰𝘯𝘷𝘦𝘳𝘴𝘢𝘵𝘪𝘰𝘯𝘴, 𝘮𝘢𝘬𝘦 𝘴𝘰𝘮𝘦 𝘯𝘦𝘸 𝘧𝘳𝘪𝘦𝘯𝘥𝘴 & 𝘴𝘱𝘳𝘦𝘢𝘥 𝘢 𝘭𝘪𝘵𝘵𝘭𝘦 𝘬𝘪𝘯𝘥𝘯𝘦𝘴𝘴 𝘢𝘳𝘰𝘶𝘯𝘥 <3
+𝘪𝘧 𝘺𝘰𝘶 𝘦𝘷𝘦𝘳 𝘧𝘦𝘦𝘭 𝘭𝘦𝘧𝘵 𝘰𝘶𝘵 𝘰𝘳 𝘩𝘢𝘷𝘦 𝘢𝘯𝘺 𝘪𝘴𝘴𝘶𝘦, 𝘧𝘦𝘦𝘭 𝘧𝘳𝘦𝘦 𝘵𝘰 𝘵𝘢𝘨 @𝘢𝘥𝘮𝘪𝘯 — 𝘸𝘦’𝘳𝘦 𝘢𝘭𝘸𝘢𝘺𝘴 𝘩𝘦𝘳𝘦 𝘵𝘰 𝘩𝘦𝘭𝘱.𝘯𝘰 𝘪𝘴𝘴𝘶𝘦 𝘪𝘴 𝘵𝘰𝘰 𝘴𝘮𝘢𝘭𝘭 𝘵𝘰 𝘮𝘦𝘯𝘵𝘪𝘰𝘯 
+𝘮𝘢𝘬𝘦 𝘴𝘶𝘳𝘦 𝘵𝘰 𝘧𝘰𝘭𝘭𝘰𝘸 𝘵𝘩𝘦 𝘳𝘶𝘭𝘦𝘴 𝘏𝘢𝘷𝘦 𝘢 𝘭𝘰𝘷𝘦𝘭𝘺 𝘵𝘪𝘮𝘦 𝘩𝘦𝘳𝘦 
+𝘣𝘰𝘳𝘢𝘩𝘢𝘦 💜"""
+
+# ═══════════════════════════════════════
+# 𐙚 NEW MEMBER WELCOME — YOUR EXACT TEXT
+# ═══════════════════════════════════════
+
+WELCOME_MESSAGE = """𐙚 {mention}, annyeong! 🪄
+
+welcome to 𝐌𝐚𝐠𝐢𝐜 𝐒𝐡𝐨𝐩 
+we’re glad to have you here 
+
+★ 𝐒𝐭𝐚𝐲 𝐮𝐩𝐝𝐚𝐭𝐞𝐝
+join our channel → @wingsofecho
+
+make yourself comfortable & have a lovely time here 
+borahae 💜"""
+
+# ═══════════════════════════════════════
+# 𐙚 HELP
+# ═══════════════════════════════════════
+
+HELP_MESSAGE = """𐙚 𝑴𝒂𝒈𝒊𝒄 𝑺𝒉𝒐𝒑 𝑴𝒆𝒏𝒖
+
+💜 𝑨𝑹𝑴𝒀
+/vibecheck
+/bias
+/borahae
+/btsquiz
+/era
+
+✦ 𝑪𝒉𝒂𝒐𝒔
+/do_nothing
+/roast
+/hug
+/slap
+/yeet
+/ship
+/fortune
+
+🎮 𝑮𝒂𝒎𝒆𝒔
+/wordgame
+/duo
+/rps
+/coinflip
+/dice
+/8ball
+/trivia
+
+♡ 𝑺𝒐𝒄𝒊𝒂𝒍
+/compliment
+/match
+/truth
+/dare
+/wouldyourather
+/question
+/news
+/award
+/sus
+/nickname
+
+🛡️ 𝑨𝒅𝒎𝒊𝒏
+/shush
+/unyeet
+/warn
+/warnings
+/rules"""
+
+# ═══════════════════════════════════════
+# 𐙚 BASIC
+# ═══════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    remember_member(chat.id, update.effective_user)
+    if chat.type != "private":
+        activate_chat(chat.id)
+        await update.message.reply_text("𐙚 𝑴𝒂𝒈𝒊𝒄 𝑺𝒉𝒐𝒑 is here ♡\n\nHourly messages are now activated for this group.\nUse /help to see what I can do.")
+    else:
+        await update.message.reply_text("𐙚 𝑯𝒆𝒍𝒍𝒐 ♡\n\nI'm the little Magic Shop bot.\nAdd me to your group and use /start there to activate me.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_MESSAGE)
+
+
+async def new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.new_chat_members: return
+    activate_chat(update.effective_chat.id)
+    for member in update.message.new_chat_members:
+        remember_member(update.effective_chat.id, member)
+        if not member.is_bot:
+            await update.message.reply_html(WELCOME_MESSAGE.format(mention=member.mention_html()))
+
+# ═══════════════════════════════════════
+# 💜 ARMY
+# ═══════════════════════════════════════
+
+async def vibecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    levels = [
+        "casual listener ♡",
+        "𝑨𝑹𝑴𝒀 in training ✦",
+        "Certified ARMY 💜",
+        "full borahae energy",
+        "maximum BTS chaos 😭",
+        "one playlist away from losing it",
+    ]
+    await update.message.reply_text(
+        f"𐙚 𝑽𝒊𝒃𝒆 𝑪𝒉𝒆𝒄𝒌\n\n{random.choice(levels)}"
+    )
+
+
+async def bias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Random BTS-bias appraisal using the user's Telegram profile info."""
+    user = update.effective_user
+    chat = update.effective_chat
+    random_biases = [
+        ("Jungkook", "you've got that quiet-until-the-chaos-starts kind of energy."),
+        ("Taehyung", "there's something suspiciously unbothered about your vibe."),
+        ("Jimin", "sweet on the outside, but definitely not as innocent as you look."),
+        ("Jin", "somehow you're serving confidence, nonsense and zero shame."),
+        ("Yoongi", "you look like you'd reply 'k' and then disappear for six hours."),
+        ("j-hope", "your vibe says sunshine first, absolute menace five minutes later."),
+        ("Namjoon", "you look like you have a perfectly normal plan and then immediately lose something."),
+    ]
+    bias_name, line = random.choice(random_biases)
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        presence = "Admin" if member.status in ("administrator", "creator") else "Member"
+    except Exception:
+        presence = "Member"
+
+    first = escape(user.first_name or "Unknown")
+    username = f"@{escape(user.username)}" if user.username else "not set"
+    user_link = f'<a href="tg://user?id={user.id}">open profile</a>'
+
+    caption = (
+        "𐙚 𝐁𝐈𝐀𝐒 𝐕𝐈𝐁𝐄 𝐂𝐇𝐄𝐂𝐊\n\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"First Name: <b>{first}</b>\n"
+        f"Username: {username}\n"
+        f"Userlink: {user_link}\n"
+        f"Presence: {presence}\n\n"
+        f"✦ Random bias: <b>{bias_name}</b>\n\n"
+        f"{line}"
+    )
+
+    try:
+        photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+        if photos.total_count:
+            await update.message.reply_photo(
+                photo=photos.photos[0][0].file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+            return
+    except Exception:
+        pass
+
+    await update.message.reply_html(caption + "\n\n(no profile picture to expose today 😭)")
+
+
+async def borahae(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    messages = [
+        "𐙚 a little borahae for the timeline 💜",
+        "borahae. that's it. that's the command. 💜",
+        "𐙚 purple hearts have entered the chat.",
+        "𝑩𝒐𝒓𝒂𝒉𝒂𝒆 💜 now go bother your favourite person.",
+    ]
+    await update.message.reply_text(random.choice(messages))
+
+
+async def era(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    eras = [
+        "HYYH era 🌸",
+        "Wings era 🪽",
+        "Love Yourself era ♡",
+        "MOTS era ✦",
+        "BE era ☁️",
+        "Proof era 💜",
+        "Arirang era 🌷",
+    ]
+    await update.message.reply_text(
+        f"𐙚 𝒀𝒐𝒖𝒓 𝒓𝒂𝒏𝒅𝒐𝒎 𝑩𝑻𝑺 𝒆𝒓𝒂:\n\n"
+        f"{random.choice(eras)}"
+    )
+
+
+QUIZ_BANK=[
+    ("How many members are in BTS?", ["7", "seven"]),
+    ("What is BTS's fandom called?", ["army"]),
+    ("What year did BTS debut?", ["2013"]),
+    ("Who is BTS's leader?", ["rm", "namjoon", "kim namjoon"]),
+    ("Who is the oldest BTS member?", ["jin", "seokjin"]),
+    ("Who is the youngest BTS member?", ["jungkook"]),
+    ("Which album includes Spring Day?", ["you never walk alone"]),
+    ("Which song was BTS's first Billboard Hot 100 #1?", ["dynamite"]),
+    ("Which member released FACE?", ["jimin"]),
+    ("Which member released GOLDEN?", ["jungkook"]),
+    ("Which member released D-DAY?", ["suga", "yoongi"]),
+    ("Which member released Indigo?", ["rm", "namjoon"]),
+    ("Which member released Layover?", ["v", "taehyung"]),
+    ("Which member released Jack In The Box?", ["j-hope", "j hope", "hoseok"]),
+    ("Who is Worldwide Handsome?", ["jin"]),
+    ("Who is the Golden Maknae?", ["jungkook"]),
+    ("What is BTS's anthology album called?", ["proof"]),
+    ("What was BTS's debut album?", ["2 cool 4 skool"]),
+    ("Which album came before Love Yourself: Tear?", ["love yourself her", "her"]),
+    ("Which album came after Love Yourself: Tear?", ["love yourself answer", "answer"]),
+    ("Which BTS song features Halsey?", ["boy with luv", "boy with love"]),
+    ("Which BTS song features Sia?", ["on"]),
+    ("Which song is associated with the line 'smooth like butter'?", ["butter"]),
+    ("Which song is famous for black swan imagery?", ["black swan"]),
+    ("Which song has a fire-themed title?", ["fire"]),
+    ("Which song has DNA in its title?", ["dna"]),
+    ("Which song has Spring Day in its title?", ["spring day"]),
+    ("Which song has MIC Drop in its title?", ["mic drop"]),
+    ("Which song has Save Me in its title?", ["save me"]),
+    ("Which member is V?", ["v", "taehyung", "kim taehyung"]),
+    ("Which member is RM?", ["rm", "namjoon", "kim namjoon"]),
+    ("Which member is SUGA?", ["suga", "yoongi", "min yoongi"]),
+    ("Which member is j-hope?", ["j-hope", "j hope", "hoseok"]),
+    ("Which member is Jimin?", ["jimin", "park jimin"]),
+    ("Which member is Jin?", ["jin", "kim seokjin"]),
+    ("Which member is Jungkook?", ["jungkook", "jeon jungkook"]),
+    ("What does HYYH stand for?", ["the most beautiful moment in life", "hyyh"]),
+    ("Which member released MUSE?", ["jimin"]),
+    ("Which member released Right Place, Wrong Person?", ["rm", "namjoon"]),
+    ("Which member released Hope on the Street?", ["j-hope", "j hope", "hoseok"]),
+    ("Which member released Happy?", ["jin", "seokjin"]),
+    ("Which member released Fri(end)s?", ["v", "taehyung"]),
+    ("Which member released WHO?", ["jungkook"]),
+    ("Which member released The Astronaut?", ["jin", "seokjin"]),
+    ("Which member released Wild Flower?", ["rm", "namjoon"]),
+    ("Which member released MORE?", ["j-hope", "j hope", "hoseok"]),
+    ("Which member released Daechwita?", ["suga", "yoongi"]),
+    ("Which member is associated with Koya?", ["rm", "namjoon"]),
+    ("Which member is associated with RJ?", ["jin"]),
+    ("Which member is associated with Cooky?", ["jungkook"]),
+    ("Which member is associated with Chimmy?", ["jimin"]),
+    ("Which member is associated with Tata?", ["v", "taehyung"]),
+    ("Which member is associated with Shooky?", ["suga", "yoongi"]),
+    ("Which member is associated with Mang?", ["j-hope", "j hope", "hoseok"]),
+]
+
+async def btsquiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    if chat_id in quiz_games:
+        await update.message.reply_text("there's already a quiz running 😭 answer that one first.")
+        return
+    used=set()
+    index=random.randrange(len(QUIZ_BANK))
+    q,answers=QUIZ_BANK[index]
+    quiz_games[chat_id]={"answers":[clean_answer(a) for a in answers],"question":q,"used":used|{index}}
+    await update.message.reply_text(
+        f"✦ 𝐁𝐓𝐒 𝑸𝒖𝒊𝒛\n\n❝ {q} ❞\n\nfirst correct answer wins 🏆\n(reply to this message with your answer)"
+    )
+
+# ═══════════════════════════════════════
+# ✦ CHAOS
+# ═══════════════════════════════════════
+
+async def do_nothing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "𐙚 𝑴𝒂𝒈𝒊𝒄 𝑺𝒉𝒐𝒑 is currently doing absolutely nothing.\n\n"
+        "finally, a productive day."
+    )
+
+
+async def hug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = " ".join(context.args) if context.args else "everyone"
+    await update.message.reply_text(
+        f"𐙚 sending {target} a very normal, non-dramatic hug ♡"
+    )
+
+
+async def roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = " ".join(context.args) if context.args else "you"
+
+    roasts = [
+        "you have the confidence of someone who did not read the instructions 😭",
+        "respectfully, even autocorrect gave up on you.",
+        "I've seen loading screens with more personality.",
+        "you really woke up and chose to be someone's headache.",
+        "that was certainly a decision. not a good one, but a decision.",
+        "your brain said 'we ball' and immediately left.",
+        "I would roast you harder but I don't want to overwork the bot.",
+        "you're proof that Wi-Fi isn't the only thing that needs reconnecting.",
+        "the confidence? impressive. the logic? missing.",
+        "10/10 commitment to being slightly inconvenient.",
+        "bro is fighting battles nobody assigned 😭",
+        "I could say something devastating but honestly... you're already doing enough.",
+        "even the group chat needs a moment to process you.",
+        "that comeback arrived three business days late.",
+        "you bring a unique energy. unfortunately, it is mostly confusion.",
+    ]
+
+    await update.message.reply_text(
+        f"𐙚 {target}, {random.choice(roasts)}"
+    )
+
+
+async def slap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = " ".join(context.args) if context.args else "you"
+    await update.message.reply_text(
+        f"𐙚 *gently bonks {target} with a pillow* ♡"
+    )
+
+
+async def yeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = " ".join(context.args) if context.args else "someone"
+    await update.message.reply_text(
+        f"𐙚 {target} has been dramatically yeeted into the "
+        "fictional void ♡"
+    )
+
+
+async def fortune(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fortunes = [
+        "something nice may find its way to you today ♡",
+        "a good surprise is waiting somewhere nearby ✦",
+        "today might be better than you expect.",
+        "your luck is looking suspiciously decent today.",
+        "take a little break. you deserve it.",
+        "someone is probably thinking about you. don't ask me who 😭",
+    ]
+    await update.message.reply_text(
+        f"✦ 𝑭𝒐𝒓𝒕𝒖𝒏𝒆\n\n{random.choice(fortunes)}"
+    )
+
+
+async def ship(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) >= 2:
+        first = context.args[0]
+        second = context.args[1]
+    else:
+        first = "you"
+        second = "someone"
+
+    score = random.randint(1, 100)
+    await update.message.reply_text(
+        f"𐙚 𝑴𝒂𝒈𝒊𝒄 𝑺𝒉𝒐𝒑 𝑴𝒂𝒕𝒄𝒉\n\n"
+        f"{first} × {second}\n"
+        f"Compatibility: {score}% ♡"
+    )
+
+async def plottwist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    twists = [
+        "plot twist: the person who said ‘5 mins’ has been gone for three hours.",
+        "plot twist: someone in this chat is reading this while pretending to be busy.",
+        "plot twist: the real group menace was the unread messages all along.",
+        "plot twist: that ‘nvm’ definitely had a whole story behind it.",
+        "plot twist: the quiet member has the most chaotic screenshots.",
+        "plot twist: someone is typing… and has been typing since the last century.",
+        "plot twist: nobody knows what’s happening, but somehow everyone agrees.",
+        "plot twist: the group chat survived another questionable decision. barely.",
+    ]
+    await update.message.reply_text(f"𐙚 𝑷𝒍𝒐𝒕 𝑻𝒘𝒊𝒔𝒕\n\n{random.choice(twists)}")
+
+
+# ═══════════════════════════════════════
+# 🎮 GAMES
+# ═══════════════════════════════════════
+
+WORD_BANK=['ARMY', 'BORAHАE', 'PURPLE', 'MAGICSHOP', 'PETAL', 'BTS', 'DYNAMITE', 'WINGS', 'JUNGKOOK', 'TAEHYUNG', 'JIMIN', 'YOONGI', 'NAMJOON', 'SEOKJIN', 'HOSEOK', 'ARIRANG', 'PROOF', 'GOLDEN', 'INDIGO', 'LAYOVER', 'FACE', 'MUSE', 'SPRINGDAY', 'BLACKSWAN', 'FIRE', 'RUN', 'DOPE', 'IDOL', 'DNA', 'EUPHORIA', 'EPIPHANY', 'SINGULARITY', 'SERENDIPITY']
+
+async def wordgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    word=pick_unused(WORD_BANK,used_wordgames,chat_id); chars=list(word); scrambled=word
+    for _ in range(30):
+        random.shuffle(chars); scrambled=''.join(chars)
+        if scrambled != word: break
+    await update.message.reply_text(f"𐙚 𝑾𝒐𝒓𝒅 𝑮𝒂𝒎𝒆\n\nunscramble this:\n\n❝ {scrambled} ❞\n\nhint: BTS / ARMY related 👀")
+
+
+async def duo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    people=members_for(chat_id)
+    if len(people)<2: await update.message.reply_text("I need at least two members who have chatted here first 😭"); return
+    a,b=random.sample(people,2)
+    lines=["one shared brain cell. excellent teamwork.","dangerously good duo energy.","the group chat was NOT prepared for this.","bestie duo detected. no romance department involved. 🫡","zero explanation. just elite duo behaviour."]
+    await update.message.reply_html(f"𐙚 𝐁𝐄𝐒𝐓 𝐃𝐔𝐎 𝐃𝐄𝐓𝐄𝐂𝐓𝐄𝐃\n\n{mention_member(a)} + {mention_member(b)}\n\n{random.choice(lines)}")
+
+
+async def rps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = random.choice(["🪨 Rock", "📄 Paper", "✂️ Scissors"])
+    await update.message.reply_text(
+        f"𐙚 Magic Shop chose: {choice}\n"
+        "your turn. don't embarrass yourself."
+    )
+
+
+async def coinflip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"𐙚 The coin says: {random.choice(['Heads ♡', 'Tails ✦'])}"
+    )
+
+
+async def dice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🎲 You rolled a {random.randint(1, 6)}"
+    )
+
+
+async def eightball(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answers = [
+        "Yes ♡",
+        "Probably.",
+        "Maybe ✦",
+        "Ask again later.",
+        "The signs say yes.",
+        "The signs say no.",
+        "Magic Shop isn't sure 😭",
+        "absolutely not. next question.",
+    ]
+    await update.message.reply_text(
+        f"𐙚 𝟖-𝑩𝒂𝒍𝒍\n\n{random.choice(answers)}"
+    )
+
+
+async def trivia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    facts = [
+        "Honey doesn't spoil easily. 🍯",
+        "Octopuses have three hearts. 🐙",
+        "A group of flamingos is called a flamboyance. 🦩",
+        "Bananas are botanically berries. 🍌",
+        "The Eiffel Tower can change height slightly with temperature. 🗼",
+    ]
+    await update.message.reply_text(
+        f"✦ 𝑻𝒓𝒊𝒗𝒊𝒂\n\n{random.choice(facts)}"
+    )
+
+# ═══════════════════════════════════════
+# ♡ SOCIAL
+# ═══════════════════════════════════════
+
+async def compliment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = " ".join(context.args) if context.args else "you"
+    compliments = [
+        "you make this place a little nicer just by being here 🤍",
+        "your presence is actually appreciated, don't let it get to your head ♡",
+        "you have a pretty lovely energy.",
+        "you're doing better than you think ✦",
+        "Magic Shop approves of you. temporarily.",
+    ]
+    await update.message.reply_text(
+        f"𐙚 {target}, {random.choice(compliments)}"
+    )
+
+
+async def match(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    people=members_for(chat_id)
+    if len(people)<2: await update.message.reply_text("not enough members have chatted here yet 😭"); return
+    a,b=random.sample(people,2); score=random.randint(1,100)
+    await update.message.reply_html(f"✦ 𝐌𝐀𝐓𝐂𝐇 𝐌𝐄𝐓𝐄𝐑\n\n{mention_member(a)} × {mention_member(b)}\n\ncompatibility: {score}%")
+
+
+TRUTH_BANK=["What's your most embarrassing group-chat moment?", 'Who was your first BTS bias?', "What's your current obsession?", "What's the weirdest thing in your gallery?", "What's your most-used emoji?", "What's your worst autocorrect disaster?", 'Who here would you trust with your phone?', 'Who here would you absolutely NOT trust with your phone?', "What's the pettiest reason you've been annoyed?", "What's one thing you're secretly competitive about?", "What's a song you're embarrassed to love?", "What's your most useless talent?", "What's the weirdest dream you remember?", "What's your biggest group-chat pet peeve?", 'Which BTS era would you bring back?', 'Which BTS song describes your week?', "What's a harmless lie you tell all the time?", "What's your most chaotic late-night thought?", "What's something you could talk about for hours?", "What's the funniest excuse you've used?", "What's a message you typed and deleted?", "What's your biggest ‘why did I send that?’ moment?", "What's a trend you secretly hate?", "What's your most questionable impulse purchase?", "What's the weirdest food combination you like?", "What's something you pretend to understand?", 'What made you laugh hardest recently?', "What's your worst typing habit?", "What's one thing you never want your friends choosing for you?", "What's your most random fear?", "What's the most dramatic thing you've done over something tiny?", 'Which BTS member is most like you?', 'What would you ask BTS if you had five minutes?', "What's your favourite BTS song right now?", "What's your current comfort show or movie?", "What's the most random thing that makes you happy?", "What's your biggest ‘I should've stayed quiet’ moment?", "What's a word you always type wrong?", "What's your most chaotic sleep-deprived thought?", "What's the last thing that made you genuinely proud of yourself?"]
+
+async def truth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    await update.message.reply_text(f"𐙚 𝑻𝒓𝒖𝒕𝒉\n\n{pick_unused(TRUTH_BANK,used_truths,chat_id)}")
+
+
+DARE_BANK=['Tag 5 members and ask what shampoo they use because their hair looks suspiciously pretty.', 'Tag 3 members and assign each a BTS song based only on personality.', 'Tag someone and accuse them of stealing your imaginary charger. Provide no evidence.', 'Give 3 people completely unnecessary job titles.', 'Tag someone and ask them to rate your vibe from 1–10. No arguing with the result.', 'Send the 7th photo in your gallery without explaining it.', 'Send your last-used sticker and refuse to explain it.', 'Tag your most chaotic mutual and give them a fake award.', 'Describe your current mood using exactly five emojis.', 'Tag two people and decide which BTS duo their personalities resemble.', 'Ask someone to choose your profile picture for the next ten minutes.', 'Tag someone and ask for their most questionable food combination.', 'Send the first word that comes to mind and defend it like a court case.', 'Tag three people and give each a dramatic movie title.', 'Ask someone to describe you using exactly three words.', 'Tag someone and tell them the group has received a complaint about their suspicious behaviour.', 'Send a random GIF and let the group decide what it means.', 'Tag someone and give them a ridiculous new nickname.', 'Choose someone and write a two-line fake breaking-news report about them.', 'Tag four people and assign ridiculous superpowers.', 'Ask someone what their first impression of you was.', 'Tag someone and compliment something oddly specific about them.', "Send your keyboard's suggested next word.", 'Tag three people and ask which BTS song describes their week.', 'Write a dramatic one-line apology to your sleep schedule.', 'Tag someone and ask them to judge your favourite BTS song.', 'Write a fake campaign slogan for a BTS member.', 'Tag someone and ask what their most suspicious group-chat habit is.', 'Give yourself a ridiculous title and keep it for five minutes.', 'Tag someone and promote them to Minister of Group Chaos.', 'Ask someone to name your villain era.', 'Tag two people and make them choose your imaginary superpower.', 'Write a fake police report about your latest embarrassing moment.', 'Tag someone and ask them to give your personality a weather forecast.', 'Ask three people what animal your vibe reminds them of.', 'Tag someone and tell them the group has received a suspicious report about them.', 'Give someone an employee-of-the-month award for absolutely no reason.', 'Tag someone and ask what crime your typing style would be arrested for.', 'Ask someone to invent a fake headline about you.', 'Tag two members and assign them roles in a ridiculous heist.']
+
+async def dare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    await update.message.reply_text(f"✦ 𝑫𝒂𝒓𝒆\n\n{pick_unused(DARE_BANK,used_dares,chat_id)}")
+
+
+WYR_BANK=['Meet BTS once or get front-row seats at every BTS concert?', 'Read minds or see the future?', 'Lose your phone for a week or Wi-Fi for a month?', 'Have your favourite song played live just for you or hear an unreleased song first?', 'Spend a whole day with your bias or get unlimited concert tickets?', 'Always know when someone is lying or always get away with lying?', 'Be famous for something embarrassing or unknown for something amazing?', 'Have perfect memory or perfect luck?', 'Never need sleep or never need money?', 'Have every photo of you look amazing or every outfit look amazing?', 'Pause time or rewind ten minutes?', 'Only listen to one BTS album forever or never replay a song again?', 'Know every spoiler or never see a spoiler again?', 'Unlimited snacks or unlimited music?', 'Travel everywhere for free or live in your dream city?', 'Have your bias reply to you or mention you on stage?', 'Be the funniest person in the room or the smartest?', 'Always have 1% battery or slow internet?', 'Have your search history shown to the group or your gallery shown?', 'Be stuck in a group chat with your biggest hater or your most chaotic friend?', 'One wish today or three small wishes next year?', 'Know exactly what people think of you or never care what anyone thinks?', 'Teleport anywhere or get unlimited concert tickets?', 'Have your favourite BTS era return for a year or get a brand-new era tomorrow?', 'Accidentally message the wrong person or like an ancient post?', 'Delete one embarrassing memory or relive one perfect day?', 'Always be early or always be late?', 'Perfect voice or perfect dance skills?', 'One song for a month or never hear your favourite song again?', 'Everyone believes your joke or nobody believes your serious statement?', 'Phone at 100% but slow or fast but always at 3%?', 'Know every secret in the group or have everyone forget your worst moment?', 'Get one perfect concert day or a lifetime of free albums?', 'Have your bias choose your outfit or your bestie choose your hairstyle?', 'Pause a conversation or rewind an entire day?', 'Never lose your headphones or never lose your charger?', 'Perfect comeback three hours late or terrible comeback instantly?', 'Famous in your city or famous online?', 'Personal chef or personal concert photographer?', 'Only communicate with GIFs for a week or voice notes for a week?', 'Favourite song stuck in your head forever or never hear it again?', 'Teleport once a day or fly one metre above ground?', 'Infinite phone storage or infinite battery?', 'Know the exact time someone will text or the exact message?', 'Mystery BTS photocard every day or one guaranteed rare one?', 'Make any friend laugh or instantly calm any argument?', 'Perfect Wi-Fi everywhere or perfect signal everywhere?', 'Be group admin forever or never leave the group?', 'Have your funniest thought accidentally sent to the chat or your oldest photo?']
+
+async def wouldyourather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user)
+    await update.message.reply_text(f"𐙚 𝑾𝒐𝒖𝒍𝒅 𝒀𝒐𝒖 𝑹𝒂𝒕𝒉𝒆𝒓\n\n{pick_unused(WYR_BANK,used_wyr,chat_id)}")
+
+
+async def question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    questions = [
+        "What's one song you could listen to forever?",
+        "What's your favourite BTS era?",
+        "What's your comfort movie?",
+        "If you could travel anywhere tomorrow, where would you go?",
+        "What's something that instantly makes you happy?",
+    ]
+    await update.message.reply_text(
+        f"✦ 𝑸𝒖𝒆𝒔𝒕𝒊𝒐𝒏 𝒐𝒇 𝒕𝒉𝒆 𝒎𝒐𝒎𝒆𝒏𝒕\n\n"
+        f"{random.choice(questions)}"
+    )
+
+NEWS_BANK=["{name} found eating a suspicious cucumber on the park side today. Looks suspicious 🤨","Breaking: {name} opened the group, read everything, and vanished. Authorities are confused.","{name} was seen online at 3 AM. Their explanation remains classified.","Breaking: {name} has been promoted to CEO of ‘I’ll reply later.’","Witnesses claim {name} typed for five minutes and sent ‘lol’. Experts are concerned.","{name} entered the chat, caused chaos, and is now pretending nothing happened.","Local sources report that {name} disappeared for six hours and returned with zero explanation.","{name} has officially been declared suspicious by absolutely nobody qualified.","Breaking: {name} was caught saying ‘nvm’ after typing an entire paragraph.","Scientists are investigating why {name} always appears exactly when the conversation ends."]
+AWARDS=["CEO of disappearing mid-conversation","Professional Yapper of the Year","Minister of Unnecessary Drama","Certified Group Chat Menace","CEO of Random Messages","Most Suspiciously Online Person","Professional Ghoster","Director of Chaos","Human Notification Generator","Chief Executive of ‘Wait What Happened?’"]
+NICKNAMES=["Tiny Menace","Certified Gremlin","Local Chaos Distributor","Professional Yapper","Group Chat Goblin","CEO of Bad Decisions","Resident Plot Twist","Captain Side Quest","Chief Typo Officer","Minister of Suspicious Behaviour","Director of Random Thoughts","Certified Screenshot Collector"]
+
+async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user); people=members_for(chat_id)
+    if not people: await update.message.reply_text("no suspects yet 😭 get a few members chatting first."); return
+    target=random.choice(people)
+    await update.message.reply_html("📰 𝐌𝐀𝐆𝐈𝐂 𝐒𝐇𝐎𝐏 𝐍𝐄𝐖𝐒\n\n"+random.choice(NEWS_BANK).format(name=mention_member(target)))
+
+async def award(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user); people=members_for(chat_id)
+    if not people: await update.message.reply_text("need some members first 😭"); return
+    target=random.choice(people); await update.message.reply_html(f"🏆 𝐎𝐅𝐅𝐈𝐂𝐈𝐀𝐋 𝐀𝐖𝐀𝐑𝐃\n\n{mention_member(target)} → {random.choice(AWARDS)}")
+
+async def sus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user); people=members_for(chat_id)
+    if not people: await update.message.reply_text("not enough suspects 👀"); return
+    target=random.choice(people); await update.message.reply_html(f"🚨 𝐒𝐔𝐒 𝐀𝐋𝐄𝐑𝐓\n\n{mention_member(target)}\nsuspicion level: {random.randint(55,99)}% 🤨")
+
+async def nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id; remember_member(chat_id, update.effective_user); people=members_for(chat_id)
+    if not people: await update.message.reply_text("need more members 😭"); return
+    target=random.choice(people); await update.message.reply_html(f"🪪 𝑵𝒊𝒄𝒌𝒏𝒂𝒎𝒆 𝑮𝒆𝒏𝒆𝒓𝒂𝒕𝒐𝒓\n\n{mention_member(target)} → {random.choice(NICKNAMES)}")
+
+async def group_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or update.effective_chat.type not in ("group","supergroup"): return
+    remember_member(update.effective_chat.id, update.effective_user)
+    game=quiz_games.get(update.effective_chat.id)
+    if not game or not update.message.text: return
+
+    # In Telegram privacy mode, replies to the bot's own quiz message are still delivered.
+    # Accept those replies; when privacy is disabled, ordinary answers work too.
+    reply = update.message.reply_to_message
+    if reply is not None and reply.from_user and reply.from_user.id != context.bot.id:
+        return
+
+    if clean_answer(update.message.text) in game["answers"]:
+        quiz_games.pop(update.effective_chat.id,None)
+        await update.message.reply_html(
+            f"🏆 𝐐𝐔𝐈𝐙 𝐖𝐈𝐍𝐍𝐄𝐑\n\n{update.effective_user.mention_html()} got it first! 😭👏\n\nquestion over. no second chances."
+        )
+
+# ═══════════════════════════════════════
+# 🛡️ ADMIN
+# ═══════════════════════════════════════
+
+async def check_admin(update: Update):
+    member = await update.effective_chat.get_member(
+        update.effective_user.id
+    )
+    return member.status in ["administrator", "creator"]
+
+
+async def shush(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        await update.message.reply_text(
+            "𐙚 This command is for admins only ♡"
+        )
+        return
+
+    await update.message.reply_text(
+        "𐙚 𝑺𝒉𝒖𝒔𝒉 mode request received ♡\n\n"
+        "Reply to a member's message when using this command "
+        "to mute them."
+    )
+
+
+async def unyeet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        await update.message.reply_text(
+            "𐙚 This command is for admins only ♡"
+        )
+        return
+
+    await update.message.reply_text(
+        "𐙚 𝑼𝒏𝒚𝒆𝒕 request received ♡"
+    )
+
+
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_admin(update):
+        await update.message.reply_text(
+            "𐙚 This command is for admins only ♡"
+        )
+        return
+
+    await update.message.reply_text(
+        "𐙚 𝑾𝒂𝒓𝒏𝒊𝒏𝒈 issued ♡"
+    )
+
+
+async def warnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "𐙚 𝑾𝒂𝒓𝒏𝒊𝒏𝒈𝒔\n\n"
+        "No saved warnings yet ♡"
+    )
+
+
+async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        """𐙚 𝑴𝒂𝒈𝒊𝒄 𝑺𝒉𝒐𝒑 𝑹𝒖𝒍𝒆𝒔
+
+♡ Please be respectful to everyone.
+♡ Don't ignore or purposely exclude members.
+♡ No unnecessary drama or spam.
+♡ Follow the admins' instructions.
+♡ Keep the group comfortable and welcoming.
+
+If you're ever uncomfortable or have an issue,
+please reach out to an admin.
+
+𝑩𝒐𝒓𝒂𝒉𝒂𝒆 💜"""
+    )
+
+# ═══════════════════════════════════════
+# ⏰ HOURLY SYSTEM
+# ═══════════════════════════════════════
+
+async def hourly_check(context: ContextTypes.DEFAULT_TYPE):
+    now=datetime.now(ZoneInfo("Asia/Kolkata"))
+    if now.minute != 0: return
+    current_hour=now.strftime("%Y-%m-%d-%H")
+    for chat_id in persistent_active_chats():
+        if last_hour_sent.get(chat_id)==current_hour: continue
+        try:
+            await context.bot.send_message(chat_id=chat_id,text=HOURLY_MESSAGE)
+            last_hour_sent[chat_id]=current_hour
+        except Exception as exc: print(f"Hourly message failed for {chat_id}: {exc}")
+
+# ═══════════════════════════════════════
+# 🌐 RENDER HEALTH SERVER
+# ═══════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Magic Shop Bot is running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_web_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server running on port {port}")
+    server.serve_forever()
+
+# ═══════════════════════════════════════
+# 🪄 START MAGIC SHOP
+# ═══════════════════════════════════════
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing. Add it privately in your Render Environment Variables.")
+    threading.Thread(target=start_web_server,daemon=True).start()
+    app=Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS,new_member))
+
+    app.add_handler(CommandHandler("vibecheck", vibecheck)); app.add_handler(CommandHandler("bias", bias)); app.add_handler(CommandHandler("borahae", borahae)); app.add_handler(CommandHandler("btsquiz", btsquiz)); app.add_handler(CommandHandler("quiz", btsquiz)); app.add_handler(CommandHandler("era", era))
+    app.add_handler(CommandHandler("do_nothing", do_nothing)); app.add_handler(CommandHandler("roast", roast)); app.add_handler(CommandHandler("hug", hug)); app.add_handler(CommandHandler("slap", slap)); app.add_handler(CommandHandler("yeet", yeet)); app.add_handler(CommandHandler("ship", ship)); app.add_handler(CommandHandler("fortune", fortune)); app.add_handler(CommandHandler("plottwist", plottwist))
+    app.add_handler(CommandHandler("wordgame", wordgame)); app.add_handler(CommandHandler("duo", duo)); app.add_handler(CommandHandler("rps", rps)); app.add_handler(CommandHandler("coinflip", coinflip)); app.add_handler(CommandHandler("dice", dice)); app.add_handler(CommandHandler("8ball", eightball)); app.add_handler(CommandHandler("trivia", trivia))
+    app.add_handler(CommandHandler("compliment", compliment)); app.add_handler(CommandHandler("match", match)); app.add_handler(CommandHandler("truth", truth)); app.add_handler(CommandHandler("dare", dare)); app.add_handler(CommandHandler("wouldyourather", wouldyourather)); app.add_handler(CommandHandler("question", question)); app.add_handler(CommandHandler("news", news)); app.add_handler(CommandHandler("award", award)); app.add_handler(CommandHandler("sus", sus)); app.add_handler(CommandHandler("nickname", nickname))
+    app.add_handler(CommandHandler("shush", shush)); app.add_handler(CommandHandler("unyeet", unyeet)); app.add_handler(CommandHandler("warn", warn)); app.add_handler(CommandHandler("warnings", warnings)); app.add_handler(CommandHandler("rules", rules))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,group_text_handler))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(hourly_check,interval=60,first=10)
+    else:
+        print("WARNING: Job queue is unavailable. Install python-telegram-bot[job-queue].")
+    print("𐙚 Magic Shop is running ♡")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__=="__main__": main()
